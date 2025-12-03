@@ -69,6 +69,23 @@ controller_interface::CallbackReturn NeuralController::on_init() {
     std::ifstream json_file(params_.model_path);
     json_file >> j;
 
+    const nlohmann::json *normalizer_json = nullptr;
+    size_t normalizer_mean_size = 0;
+    size_t normalizer_std_size = 0;
+    if (j.contains("normalizer") && j["normalizer"].is_object()) {
+      const auto &normalizer_obj = j["normalizer"];
+      if (normalizer_obj.contains("mean") && normalizer_obj["mean"].is_array() &&
+          normalizer_obj.contains("std") && normalizer_obj["std"].is_array()) {
+        normalizer_json = &normalizer_obj;
+        normalizer_mean_size = normalizer_obj["mean"].size();
+        normalizer_std_size = normalizer_obj["std"].size();
+      } else {
+        RCLCPP_WARN(get_node()->get_logger(),
+                    "Policy JSON contains 'normalizer' but mean/std arrays are missing. "
+                    "Skipping normalization.");
+      }
+    }
+
     auto set_param_from_json_vector = [&](const std::string &key, auto &param) {
       if (j.find(key) != j.end()) {
         RCLCPP_INFO(get_node()->get_logger(), "From JSON, setting %s vector element-by-element",
@@ -129,51 +146,76 @@ controller_interface::CallbackReturn NeuralController::on_init() {
                   params_.observation_history);
     }
 
+    if (normalizer_json != nullptr) {
+      if (normalizer_mean_size == normalizer_std_size &&
+          normalizer_mean_size % static_cast<size_t>(kSingleObservationSize) == 0) {
+        size_t derived_history = normalizer_mean_size / static_cast<size_t>(kSingleObservationSize);
+        if (params_.observation_history != static_cast<int>(derived_history)) {
+          RCLCPP_INFO(get_node()->get_logger(),
+                      "Normalizer size (%zu) implies observation_history=%zu. Adjusting controller "
+                      "parameter from %ld.",
+                      normalizer_mean_size, derived_history, params_.observation_history);
+          params_.observation_history = static_cast<int>(derived_history);
+        }
+      } else if (normalizer_mean_size != normalizer_std_size) {
+        RCLCPP_WARN(get_node()->get_logger(),
+                    "Normalizer mean/std sizes mismatch (mean=%zu std=%zu). Skipping normalization.",
+                    normalizer_mean_size, normalizer_std_size);
+        normalizer_json = nullptr;
+      } else {
+        RCLCPP_WARN(get_node()->get_logger(),
+                    "Normalizer size (%zu) not divisible by single observation size (%d). "
+                    "Skipping normalization.",
+                    normalizer_mean_size, kSingleObservationSize);
+        normalizer_json = nullptr;
+      }
+    }
+
     // Check that the observation history is consistent with the model input shape
-    if (j["in_shape"].at(1) != params_.observation_history * kSingleObservationSize) {
-      RCLCPP_ERROR(get_node()->get_logger(),
-                   "observation_history (%ld) * kSingleObservationSize (%d) != in_shape (%d)",
-                   params_.observation_history, kSingleObservationSize,
-                   static_cast<int>(j["in_shape"].at(1)));
-      return controller_interface::CallbackReturn::ERROR;
+    if (j.contains("in_shape") && j["in_shape"].is_array() && j["in_shape"].size() > 1) {
+      if (j["in_shape"].at(1) != params_.observation_history * kSingleObservationSize) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "observation_history (%ld) * kSingleObservationSize (%d) != in_shape (%d)",
+                     params_.observation_history, kSingleObservationSize,
+                     static_cast<int>(j["in_shape"].at(1)));
+        return controller_interface::CallbackReturn::ERROR;
+      }
+    } else {
+      RCLCPP_INFO(get_node()->get_logger(),
+                  "Policy JSON missing 'in_shape'. Relying on controller parameters/normalizer to "
+                  "define observation size.");
     }
 
     const size_t expected_observation_size =
         static_cast<size_t>(params_.observation_history) * static_cast<size_t>(kSingleObservationSize);
-    if (j.contains("normalizer") && j["normalizer"].is_object()) {
-      const auto &normalizer = j["normalizer"];
-      if (normalizer.contains("mean") && normalizer.contains("std") && normalizer["mean"].is_array() &&
-          normalizer["std"].is_array()) {
-        if (normalizer["mean"].size() == expected_observation_size &&
-            normalizer["std"].size() == expected_observation_size) {
-          normalizer_mean_.resize(expected_observation_size, 0.0f);
-          normalizer_inv_std_.resize(expected_observation_size, 1.0f);
-          bool warned_about_zero_std = false;
-          for (size_t i = 0; i < expected_observation_size; ++i) {
-            normalizer_mean_.at(i) = normalizer["mean"].at(i).get<float>();
-            float std_value = normalizer["std"].at(i).get<float>();
-            if (std::fabs(std_value) < 1e-6f) {
-              if (!warned_about_zero_std) {
-                RCLCPP_WARN(get_node()->get_logger(),
-                            "normalizer.std contains near-zero entries. Clamping to 1.0 to avoid division by zero.");
-                warned_about_zero_std = true;
-              }
-              std_value = 1.0f;
+    if (normalizer_json != nullptr) {
+      if (normalizer_mean_size == expected_observation_size &&
+          normalizer_std_size == expected_observation_size) {
+        normalizer_mean_.resize(expected_observation_size, 0.0f);
+        normalizer_inv_std_.resize(expected_observation_size, 1.0f);
+        bool warned_about_zero_std = false;
+        for (size_t i = 0; i < expected_observation_size; ++i) {
+          normalizer_mean_.at(i) = normalizer_json->at("mean").at(i).get<float>();
+          float std_value = normalizer_json->at("std").at(i).get<float>();
+          if (std::fabs(std_value) < 1e-6f) {
+            if (!warned_about_zero_std) {
+              RCLCPP_WARN(get_node()->get_logger(),
+                          "normalizer.std contains near-zero entries. Clamping to 1.0 to avoid "
+                          "division by zero.");
+              warned_about_zero_std = true;
             }
-            normalizer_inv_std_.at(i) = 1.0f / std_value;
+            std_value = 1.0f;
           }
-          use_normalizer_ = true;
-          RCLCPP_INFO(get_node()->get_logger(),
-                      "Loaded observation normalizer (size %zu) from policy JSON.", expected_observation_size);
-        } else {
-          RCLCPP_WARN(get_node()->get_logger(),
-                      "Skipping observation normalizer: expected %zu entries but got mean=%zu std=%zu.",
-                      expected_observation_size, static_cast<size_t>(normalizer["mean"].size()),
-                      static_cast<size_t>(normalizer["std"].size()));
+          normalizer_inv_std_.at(i) = 1.0f / std_value;
         }
+        use_normalizer_ = true;
+        RCLCPP_INFO(get_node()->get_logger(),
+                    "Loaded observation normalizer (size %zu) from policy JSON.",
+                    expected_observation_size);
       } else {
         RCLCPP_WARN(get_node()->get_logger(),
-                    "Skipping observation normalizer: mean/std arrays missing in policy JSON.");
+                    "Skipping observation normalizer: expected %zu entries but got mean=%zu std=%zu.",
+                    expected_observation_size, normalizer_mean_size, normalizer_std_size);
       }
     }
 
