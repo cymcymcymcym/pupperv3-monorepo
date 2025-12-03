@@ -1,6 +1,7 @@
 #include "neural_controller/neural_controller.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <utility>
@@ -45,6 +46,11 @@ controller_interface::CallbackReturn NeuralController::on_init() {
   try {
     param_listener_ = std::make_shared<ParamListener>(get_node());
     params_ = param_listener_->get_params();
+
+    use_normalizer_ = false;
+    normalizer_mean_.clear();
+    normalizer_inv_std_.clear();
+    normalized_observation_.clear();
 
     if (params_.gain_multiplier < 0.0) {
       RCLCPP_ERROR(get_node()->get_logger(), "Gain_multiplier must be >= 0.0. Stopping");
@@ -132,6 +138,45 @@ controller_interface::CallbackReturn NeuralController::on_init() {
       return controller_interface::CallbackReturn::ERROR;
     }
 
+    const size_t expected_observation_size =
+        static_cast<size_t>(params_.observation_history) * static_cast<size_t>(kSingleObservationSize);
+    if (j.contains("normalizer") && j["normalizer"].is_object()) {
+      const auto &normalizer = j["normalizer"];
+      if (normalizer.contains("mean") && normalizer.contains("std") && normalizer["mean"].is_array() &&
+          normalizer["std"].is_array()) {
+        if (normalizer["mean"].size() == expected_observation_size &&
+            normalizer["std"].size() == expected_observation_size) {
+          normalizer_mean_.resize(expected_observation_size, 0.0f);
+          normalizer_inv_std_.resize(expected_observation_size, 1.0f);
+          bool warned_about_zero_std = false;
+          for (size_t i = 0; i < expected_observation_size; ++i) {
+            normalizer_mean_.at(i) = normalizer["mean"].at(i).get<float>();
+            float std_value = normalizer["std"].at(i).get<float>();
+            if (std::fabs(std_value) < 1e-6f) {
+              if (!warned_about_zero_std) {
+                RCLCPP_WARN(get_node()->get_logger(),
+                            "normalizer.std contains near-zero entries. Clamping to 1.0 to avoid division by zero.");
+                warned_about_zero_std = true;
+              }
+              std_value = 1.0f;
+            }
+            normalizer_inv_std_.at(i) = 1.0f / std_value;
+          }
+          use_normalizer_ = true;
+          RCLCPP_INFO(get_node()->get_logger(),
+                      "Loaded observation normalizer (size %zu) from policy JSON.", expected_observation_size);
+        } else {
+          RCLCPP_WARN(get_node()->get_logger(),
+                      "Skipping observation normalizer: expected %zu entries but got mean=%zu std=%zu.",
+                      expected_observation_size, static_cast<size_t>(normalizer["mean"].size()),
+                      static_cast<size_t>(normalizer["std"].size()));
+        }
+      } else {
+        RCLCPP_WARN(get_node()->get_logger(),
+                    "Skipping observation normalizer: mean/std arrays missing in policy JSON.");
+      }
+    }
+
   } catch (const std::exception &e) {
     fprintf(stderr, "Exception thrown during init stage with message: %s \n", e.what());
     return controller_interface::CallbackReturn::ERROR;
@@ -209,6 +254,22 @@ controller_interface::CallbackReturn NeuralController::on_activate(
 
   // Initialize the observation vector
   observation_.resize(params_.observation_history * kSingleObservationSize, 0.0);
+
+  if (use_normalizer_) {
+    if (normalizer_mean_.size() != observation_.size() ||
+        normalizer_inv_std_.size() != observation_.size()) {
+      RCLCPP_WARN(get_node()->get_logger(),
+                  "Observation normalizer size mismatch (mean=%zu std=%zu expected=%zu). "
+                  "Disabling normalization.",
+                  normalizer_mean_.size(), normalizer_inv_std_.size(), observation_.size());
+      use_normalizer_ = false;
+      normalized_observation_.clear();
+    } else {
+      normalized_observation_.assign(observation_.size(), 0.0f);
+    }
+  } else {
+    normalized_observation_.clear();
+  }
 
   // Set the gravity z-component in the initial observation vector
   for (int i = 0; i < params_.observation_history; i++) {
@@ -470,14 +531,14 @@ controller_interface::return_type NeuralController::update(const rclcpp::Time &t
     observation_.at(3) = (float)projected_gravity_vector[0];
     observation_.at(4) = (float)projected_gravity_vector[1];
     observation_.at(5) = (float)projected_gravity_vector[2];
-    // Velocity commands
-    observation_.at(6) = (float)cmd_x_vel_;
-    observation_.at(7) = (float)cmd_y_vel_;
-    observation_.at(8) = (float)cmd_yaw_vel_;
-    // Orientation commands
-    observation_.at(9) = (float)desired_world_z_in_body_frame_.getX();
-    observation_.at(10) = (float)desired_world_z_in_body_frame_.getY();
-    observation_.at(11) = (float)desired_world_z_in_body_frame_.getZ();
+    // Velocity command slots (pure RL policy expects zeros)
+    observation_.at(6) = 0.0f;
+    observation_.at(7) = 0.0f;
+    observation_.at(8) = 0.0f;
+    // Desired orientation slot fixed at [0, 0, 1]
+    observation_.at(9) = 0.0f;
+    observation_.at(10) = 0.0f;
+    observation_.at(11) = 1.0f;
 
     // Joint positions
     for (int i = 0; i < kActionSize; i++) {
@@ -563,7 +624,18 @@ controller_interface::return_type NeuralController::update(const rclcpp::Time &t
   auto start_time = std::chrono::high_resolution_clock::now();
 
   // Perform policy inference
-  model_->forward(observation_.data());
+  const float *model_input = observation_.data();
+  if (use_normalizer_) {
+    if (normalized_observation_.size() != observation_.size()) {
+      normalized_observation_.assign(observation_.size(), 0.0f);
+    }
+    for (size_t i = 0; i < observation_.size(); ++i) {
+      normalized_observation_.at(i) =
+          (observation_.at(i) - normalizer_mean_.at(i)) * normalizer_inv_std_.at(i);
+    }
+    model_input = normalized_observation_.data();
+  }
+  model_->forward(model_input);
 
   // Measure the time after policy inference
   auto end_time = std::chrono::high_resolution_clock::now();

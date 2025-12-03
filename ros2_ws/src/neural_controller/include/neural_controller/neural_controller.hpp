@@ -69,8 +69,8 @@ class NeuralController : public controller_interface::ControllerInterface {
   static constexpr int kLastActionIdx = kJointPositionIdx + kActionSize;
   static constexpr int kSingleObservationSize = 3              /* base link angular velocity */
                                                 + 3            /* projected gravity vector */
-                                                + 3            /* x, y, yaw velocity commands */
-                                                + 3            /* desired world z in body frame */
+                                                + 3            /* velocity command slot (zeroed) */
+                                                + 3            /* desired world z slot (fixed [0,0,1]) */
                                                 + kActionSize  /* joint positions */
                                                 + kActionSize; /* previous action */
   static constexpr int kGravityZIndx = 5;  // Index of gravity z component in the observation
@@ -83,6 +83,12 @@ class NeuralController : public controller_interface::ControllerInterface {
 
   // Observation vector. Size is determined at runtime by the observation history parameter
   std::vector<float> observation_ = {};
+
+  // Optional observation normalization buffers
+  std::vector<float> normalizer_mean_ = {};
+  std::vector<float> normalizer_inv_std_ = {};
+  std::vector<float> normalized_observation_ = {};
+  bool use_normalizer_ = false;
 
   // Action vector
   std::array<float, kActionSize> action_ = {};
